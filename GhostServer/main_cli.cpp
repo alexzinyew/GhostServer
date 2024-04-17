@@ -1,0 +1,412 @@
+#include "networkmanager.h"
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <string>
+
+#ifdef _WIN32
+    #include <iostream>
+#else
+    #include <poll.h>
+    #include <unistd.h>
+#endif
+
+static volatile int g_should_stop = 0;
+
+static enum {
+    CMD_NONE,
+    CMD_COUNTDOWN_SET,
+    CMD_DISCONNECT,
+    CMD_DISCONNECT_ID,
+    CMD_BAN,
+    CMD_BAN_ID,
+    CMD_SERVER_MSG,
+    CMD_ADD_ADMIN,
+    CMD_REMOVE_ADMIN,
+} g_current_cmd;
+
+static char *g_entered_pre;
+static char *g_entered_post;
+static int g_countdown_duration = -1;
+
+static NetworkManager *g_network;
+
+static void handle_cmd(char *line) {
+    while (isspace(*line)) ++line;
+
+    size_t len = strlen(line);
+
+    while (len > 0 && isspace(line[len-1])) {
+        line[len-1] = 0;
+        len -= 1;
+    }
+
+    switch (g_current_cmd) {
+    case CMD_NONE:
+        if (len == 0)
+            return;
+
+        if (!strcmp(line, "quit")) {
+            g_should_stop = 1;
+            return;
+        }
+
+        if (!strcmp(line, "help")) {
+            puts("Available commands:");
+            puts("  help                show this list");
+            puts("  quit                terminate the server");
+            puts("  list                list all the currently connected clients");
+            puts("  countdown_set       set the pre/post cmds and countdown duration");
+            puts("  countdown           start a countdown");
+            puts("  disconnect          disconnect a client by name");
+            puts("  disconnect_id       disconnect a client by ID");
+            puts("  ban                 ban connections from a certain IP by ghost name");
+            puts("  ban_id              ban connections from a certain IP by ghost ID");
+            puts("  accept_players      start accepting connections from players");
+            puts("  refuse_players      stop accepting connections from players");
+            puts("  accept_spectators   start accepting connections from spectators");
+            puts("  refuse_spectators   stop accepting connections from spectators");
+            puts("  server_msg          send all clients a message from the server");
+            puts("  add_admin           allows a user to run admin commands by ghost ID");
+            puts("  remove_admin        removes a users admin by ghost ID");
+            return;
+        }
+
+        if (!strcmp(line, "list")) {
+            g_network->ScheduleServerThread([]() {
+                if (g_network->clients.empty()) {
+                    puts("No clients");
+                } else {
+                    puts("Clients:");
+                    for (auto& cl : g_network->clients) {
+                        printf("  %-3d %s @ %s:%d", cl.ID, cl.name.c_str(), cl.IP.toString().c_str(), (int)cl.port);
+
+                        switch (cl.state) {
+                        case STATE::TAGGED:
+                            printf(" [TAGGED]");
+                            break;
+                        case STATE::SEEKER:
+                            printf(" [SEEKER]");
+                            break;
+                        case STATE::HIDER:
+                            printf(" [HIDER]");
+                            break;
+                        }
+
+                        if (cl.spectator) {
+                            printf(" [SPECTATOR]");
+                        }
+
+                        if (std::find(g_network->admins.begin(), g_network->admins.end(), cl.ID) != g_network->admins.end()) {
+                            printf(" [ADMIN]");
+                        }
+
+                        printf("\n");
+                    }
+                }
+            });
+            return;
+        }
+
+        if (!strcmp(line, "countdown")) {
+            if (g_countdown_duration == -1) {
+                puts("Set a countdown first using countdown_set.");
+                return;
+            }
+            g_network->ScheduleServerThread([]() {
+                g_network->StartCountdown(std::string(g_entered_pre), std::string(g_entered_post), g_countdown_duration);
+            });
+            puts("Started countdown with:");
+            printf("  pre-cmd '%s'\n", g_entered_pre);
+            printf("  post-cmd '%s'\n", g_entered_post);
+            printf("  duration %d\n", g_countdown_duration);
+            return;
+        }
+
+        if (!strcmp(line, "countdown_set")) {
+            g_current_cmd = CMD_COUNTDOWN_SET;
+            if (g_entered_pre)
+                free(g_entered_pre);
+            if (g_entered_post)
+                free(g_entered_post);
+            g_entered_pre = g_entered_post = NULL;
+            g_countdown_duration = -1;
+            fputs("Pre-countdown command: ", stdout);
+            fflush(stdout);
+            return;
+        }
+
+        if (!strcmp(line, "disconnect")) {
+            g_current_cmd = CMD_DISCONNECT;
+            fputs("Name of player to disconnect: ", stdout);
+            fflush(stdout);
+            return;
+        }
+
+        if (!strcmp(line, "disconnect_id")) {
+            g_current_cmd = CMD_DISCONNECT_ID;
+            fputs("ID of player to disconnect: ", stdout);
+            fflush(stdout);
+            return;
+        }
+
+        if (!strcmp(line, "ban")) {
+            g_current_cmd = CMD_BAN;
+            fputs("Name of player to ban: ", stdout);
+            fflush(stdout);
+            return;
+        }
+
+        if (!strcmp(line, "ban_id")) {
+            g_current_cmd = CMD_BAN_ID;
+            fputs("ID of player to ban: ", stdout);
+            fflush(stdout);
+            return;
+        }
+
+        if (!strcmp(line, "accept_players")) {
+            g_network->ScheduleServerThread([]() {
+                g_network->acceptingPlayers = true;
+            });
+            puts("Now accepting connections from players");
+            return;
+        }
+
+        if (!strcmp(line, "refuse_players")) {
+            g_network->ScheduleServerThread([]() {
+                g_network->acceptingPlayers = false;
+            });
+            puts("Now refusing connections from players");
+            return;
+        }
+
+        if (!strcmp(line, "accept_spectators")) {
+            g_network->ScheduleServerThread([]() {
+                g_network->acceptingSpectators = true;
+            });
+            puts("Now accepting connections from spectators");
+            return;
+        }
+
+        if (!strcmp(line, "refuse_spectators")) {
+            g_network->ScheduleServerThread([]() {
+                g_network->acceptingSpectators = false;
+            });
+            puts("Now refusing connections from spectators");
+            return;
+        }
+
+        if (!strcmp(line, "server_msg")) {
+            g_current_cmd = CMD_SERVER_MSG;
+            fputs("Message to send: ", stdout);
+            fflush(stdout);
+            return;
+        }
+
+        if (!strcmp(line, "add_admin")) {
+            g_current_cmd = CMD_ADD_ADMIN;
+            fputs("ID of player to admin: ", stdout);
+            fflush(stdout);
+            return;
+        }
+
+        if (!strcmp(line, "remove_admin")) {
+            g_current_cmd = CMD_REMOVE_ADMIN;
+            fputs("ID of player to remove admin from: ", stdout);
+            fflush(stdout);
+            return;
+        }
+
+        printf("Unknown command: '%s'\n", line);
+        return;
+
+    case CMD_COUNTDOWN_SET:
+        if (!g_entered_pre) {
+            g_entered_pre = strdup(line);
+            fputs("Post-countdown command: ", stdout);
+            fflush(stdout);
+            return;
+        }
+
+        if (!g_entered_post) {
+            g_entered_post = strdup(line);
+            fputs("Countdown duration: ", stdout);
+            fflush(stdout);
+            return;
+        }
+
+        g_countdown_duration = atoi(line);
+        if (g_countdown_duration < 0 || g_countdown_duration > 60) {
+            puts("Bad countdown duration; not setting countdown.");
+            if (g_entered_pre)
+                free(g_entered_pre);
+            if (g_entered_post)
+                free(g_entered_post);
+            g_entered_pre = g_entered_post = NULL;
+            g_countdown_duration = -1;
+            g_current_cmd = CMD_NONE;
+            return;
+        }
+
+        puts("Initialized countdown");
+        g_current_cmd = CMD_NONE;
+
+        return;
+
+    case CMD_DISCONNECT:
+        g_current_cmd = CMD_NONE;
+        if (len != 0) {
+            std::string l1(line);
+            g_network->ScheduleServerThread([=]() {
+                auto players = g_network->GetPlayerByName(l1);
+                for (auto cl : players)
+                    g_network->DisconnectPlayer(*cl, "kicked");
+            });
+            printf("Disconnected player '%s'\n", line);
+        }
+        return;
+
+    case CMD_DISCONNECT_ID:
+        g_current_cmd = CMD_NONE;
+        if (len != 0) {
+            int id = atoi(line);
+            g_network->ScheduleServerThread([=]() {
+                auto cl = g_network->GetClientByID(id);
+                if (cl)
+                    g_network->DisconnectPlayer(*cl, "kicked");
+            });
+            printf("Disconnected player ID %d\n", id);
+        }
+        return;
+
+    case CMD_BAN:
+        g_current_cmd = CMD_NONE;
+        if (len != 0) {
+            std::string l1(line);
+            g_network->ScheduleServerThread([=]() {
+                auto players = g_network->GetPlayerByName(l1);
+                for (auto cl : players)
+                    g_network->BanClientIP(*cl);
+            });
+            printf("Banned player '%s'\n", line);
+        }
+        return;
+
+    case CMD_BAN_ID:
+        g_current_cmd = CMD_NONE;
+        if (len != 0) {
+            int id = atoi(line);
+            g_network->ScheduleServerThread([=]() {
+                auto cl = g_network->GetClientByID(id);
+                if (cl)
+                    g_network->BanClientIP(*cl);
+            });
+            printf("Banned player ID %d\n", id);
+        }
+        return;
+
+    case CMD_SERVER_MSG:
+        g_current_cmd = CMD_NONE;
+        g_network->ServerMessage(line);
+        return;
+
+    case CMD_ADD_ADMIN:
+        g_current_cmd = CMD_NONE;
+        if (len != 0) {
+            int id = atoi(line);
+            g_network->ScheduleServerThread([=]() {
+                auto cl = g_network->GetClientByID(id);
+                if (cl) {
+                    g_network->admins.push_back(id);
+                    printf("Gave admin to player ID %d (%s)\n", id, cl->name.c_str());
+                } else {
+                    printf("Player ID %d is not a valid ID\n", id);
+                }
+            });
+        }
+        return;
+
+    case CMD_REMOVE_ADMIN:
+        g_current_cmd = CMD_NONE;
+        if (len != 0) {
+            int id = atoi(line);
+
+            g_network->ScheduleServerThread([=]() {
+                auto client = g_network->GetClientByID(id);
+                if (client) {
+                    auto idx = find(g_network->admins.begin(), g_network->admins.end(), id);
+                    if (idx != g_network->admins.end()) {
+                         g_network->admins.erase(idx);
+                    } else {
+                        printf("Player ID %d (%s) is not an admin\n", id, client->name.c_str());
+                    }
+                } else {
+                    printf("Player ID %d is not a valid ID\n", id);
+                }
+            });
+            printf("Removed admin from player ID %d\n", id);
+        }
+        return;
+    }
+}
+
+int main(int argc, char *argv[]) {
+    signal(SIGINT, +[](int s) {
+        g_should_stop = 1;
+    });
+
+    if (argc > 3) {
+        printf("Usage: %s [port]\n", argv[0]);
+        return 1;
+    }
+
+    int port = 53000;
+    if (argc >= 2) {
+        port = atoi(argv[1]);
+        if (port < 1 || port > 65535) {
+            printf("Invalid port %d\n", port);
+            return 1;
+        }
+    }
+
+    const char *logfile = "ghost_log";
+    if (argc >= 3) {
+        logfile = argv[2];
+    }
+
+    NetworkManager network(logfile);
+    g_network = &network;
+
+    puts("Server starting up");
+    network.StartServer(port);
+    while (!g_should_stop) {
+#ifdef _WIN32
+        char line[50];
+        if (std::cin.getline(line, 50))
+            handle_cmd(line);
+#else
+        struct pollfd fds[] = {
+            (struct pollfd){
+                .fd = STDIN_FILENO,
+                .events = POLLIN,
+                .revents = 0,
+            },
+        };
+
+        if (poll(fds, sizeof fds / sizeof fds[0], 50) == 1) {
+            if (fds[0].revents & POLLIN) {
+                char* line = NULL;
+                size_t len = 0;
+                if (getline(&line, &len, stdin) != -1)
+                    handle_cmd(line);
+                if (line)
+                    free(line);
+            }
+        }
+#endif
+    }
+    puts("Server shutting down");
+    network.StopServer();
+
+    return 0;
+}
